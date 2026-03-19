@@ -1,0 +1,205 @@
+@base = http://localhost:4000/api/v1
+@token = Bearer REMPLACE_PAR_TON_TOKEN
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Health check (sans token)
+GET http://localhost:4000/health
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Inscription
+POST {{base}}/auth/register
+Content-Type: application/json
+
+{
+  "email": "admin@test.com",
+  "password": "Admin1234!",
+  "firstName": "Admin",
+  "lastName": "Test",
+  "companyName": "Ma Société"
+}
+
+### Connexion → copie le token dans @token ci-dessus
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "admin@test.com",
+  "password": "Admin1234!"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Lister les clients
+GET {{base}}/clients
+Authorization: {{token}}
+
+### Créer un client
+POST {{base}}/clients
+Authorization: {{token}}
+Content-Type: application/json
+
+{
+  "name": "Acme Corp",
+  "type": "COMPANY",
+  "email": "contact@acme.com",
+  "phone": "0600000000",
+  "siret": "12345678900001"
+}
+
+### Détail client
+GET {{base}}/clients/REMPLACE_PAR_ID_CLIENT
+Authorization: {{token}}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUITS
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Lister les produits
+GET {{base}}/products
+Authorization: {{token}}
+
+### Créer une catégorie
+POST {{base}}/products/categories
+Authorization: {{token}}
+Content-Type: application/json
+
+{
+  "name": "Développement",
+  "color": "#6366f1"
+}
+
+### Créer un produit
+POST {{base}}/products
+Authorization: {{token}}
+Content-Type: application/json
+
+{
+  "type": "SERVICE",
+  "name": "Développement web",
+  "unitPrice": 550,
+  "vatRate": 20,
+  "unit": "DAY"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEVIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Lister les devis
+GET {{base}}/quotes
+Authorization: {{token}}
+
+### Créer un devis
+POST {{base}}/quotes
+Authorization: {{token}}
+Content-Type: application/json
+
+{
+  "clientId": "REMPLACE_PAR_ID_CLIENT",
+  "issueDate": "2026-03-15",
+  "expiryDate": "2026-04-15",
+  "subject": "Développement application web",
+  "lines": [
+    {
+      "description": "Développement web",
+      "quantity": 5,
+      "unitPrice": 550,
+      "vatRate": 20,
+      "position": 0
+    }
+  ]
+}
+
+### Envoyer un devis (DRAFT → SENT)
+POST {{base}}/quotes/REMPLACE_PAR_ID_DEVIS/send
+Authorization: {{token}}
+
+### Accepter un devis
+POST {{base}}/quotes/REMPLACE_PAR_ID_DEVIS/accept
+Authorization: {{token}}
+
+### Convertir en facture
+POST {{base}}/quotes/REMPLACE_PAR_ID_DEVIS/convert
+Authorization: {{token}}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FACTURES
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Lister les factures
+GET {{base}}/invoices
+Authorization: {{token}}
+
+### Créer une facture directe
+POST {{base}}/invoices
+Authorization: {{token}}
+Content-Type: application/json
+
+{
+  "clientId": "REMPLACE_PAR_ID_CLIENT",
+  "issueDate": "2026-03-15",
+  "dueDate": "2026-04-15",
+  "subject": "Prestation mars 2026",
+  "lines": [
+    {
+      "description": "Développement web",
+      "quantity": 3,
+      "unitPrice": 550,
+      "vatRate": 20,
+      "position": 0
+    }
+  ]
+}
+
+### Envoyer une facture
+POST {{base}}/invoices/REMPLACE_PAR_ID_FACTURE/send
+Authorization: {{token}}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAIEMENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Enregistrer un paiement
+POST {{base}}/payments
+Authorization: {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "REMPLACE_PAR_ID_FACTURE",
+  "amount": 1980,
+  "method": "BANK_TRANSFER",
+  "paymentDate": "2026-03-15",
+  "reference": "VIR-2026-001"
+}
+
+### Stats paiements
+GET {{base}}/payments/stats
+Authorization: {{token}}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPTABILITÉ
+# ─────────────────────────────────────────────────────────────────────────────
+
+### Journal ventes mars 2026
+GET {{base}}/accounting/journal?year=2026&month=3
+Authorization: {{token}}
+
+### Rapport TVA T1 2026
+GET {{base}}/accounting/vat?year=2026&quarter=1
+Authorization: {{token}}
+
+### Export FEC 2026
+GET {{base}}/accounting/export/fec?year=2026
+Authorization: {{token}}
+
+### Export CSV mars 2026
+GET {{base}}/accounting/export/csv?year=2026&month=3
+Authorization: {{token}}

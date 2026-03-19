@@ -1,0 +1,766 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Prisma Schema — SaaS Gestion d'Entreprise
+// Modules : Auth (Tenant, User, Tokens) + Factures
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-1.0.x", "rhel-openssl-3.0.x", "debian-openssl-1.0.x", "debian-openssl-1.1.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AUTH — Enums
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum TenantPlan {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+// Hiérarchie : owner > admin > accountant > user
+enum UserRole {
+  OWNER       // Créateur du compte, tous les droits
+  ADMIN       // Gestion des utilisateurs et paramètres
+  ACCOUNTANT  // Accès comptabilité + factures (lecture/écriture)
+  USER        // Accès standard (clients, devis, factures)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AUTH — Modèles
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── Tenant ──────────────────────────────────────────────────────────────────
+// Une organisation = un tenant. Toutes les données sont isolées par tenant_id.
+
+model Tenant {
+  id       String     @id @default(uuid())
+  name     String     @db.VarChar(255)
+  slug     String     @unique @db.VarChar(100) // sous-domaine ou identifiant URL
+  plan     TenantPlan @default(FREE)
+  isActive Boolean    @default(true) @map("is_active")
+
+  // Informations société (utilisées sur les PDFs)
+  companyName   String? @map("company_name") @db.VarChar(255)
+  siret         String? @db.VarChar(20)
+  vatNumber     String? @map("vat_number") @db.VarChar(30)  // Numéro TVA intracommunautaire
+  addressLine1  String? @map("address_line1")
+  addressLine2  String? @map("address_line2")
+  city          String? @db.VarChar(100)
+  zipCode       String? @map("zip_code") @db.VarChar(20)
+  country       String  @default("FR") @db.Char(2)
+  phone         String? @db.VarChar(30)
+  logoUrl       String? @map("logo_url")
+
+  // Paramètres de facturation
+  defaultPaymentTermDays Int     @default(30) @map("default_payment_term_days")
+  defaultVatRate         Decimal @default(20) @map("default_vat_rate") @db.Decimal(5, 2)
+  invoiceFooter          String? @map("invoice_footer") @db.Text
+
+  // Configuration email (SMTP par tenant)
+  smtpHost    String? @map("smtp_host") @db.VarChar(255)
+  smtpPort    Int?    @map("smtp_port")
+  smtpSecure  Boolean @default(false) @map("smtp_secure")
+  smtpUser    String? @map("smtp_user") @db.VarChar(255)
+  smtpPass    String? @map("smtp_pass") @db.VarChar(500)
+  smtpFrom    String? @map("smtp_from") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  users              User[]
+  clients            Client[]
+  quotes             Quote[]
+  invoices           Invoice[]
+  payments           Payment[]
+  deposits           Deposit[]
+  products           Product[]
+  productCategories  ProductCategory[]
+  journalEntries     JournalEntry[]
+
+  @@map("tenants")
+}
+
+// ─── User ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id       String   @id @default(uuid())
+  tenantId String   @map("tenant_id")
+  email    String   @unique @db.VarChar(255)
+  role     UserRole @default(USER)
+
+  // Identité
+  firstName String? @map("first_name") @db.VarChar(100)
+  lastName  String? @map("last_name")  @db.VarChar(100)
+  avatarUrl String? @map("avatar_url")
+
+  // Sécurité
+  passwordHash    String    @map("password_hash") @db.VarChar(255)
+  emailVerified   Boolean   @default(false) @map("email_verified")
+  isActive        Boolean   @default(true)  @map("is_active")
+
+  // Anti brute-force
+  failedAttempts  Int       @default(0)  @map("failed_attempts")
+  lockedUntil     DateTime? @map("locked_until") // NULL = pas verrouillé
+
+  // Audit
+  lastLoginAt DateTime? @map("last_login_at")
+  lastLoginIp String?   @map("last_login_ip") @db.VarChar(45) // IPv6 max 45 chars
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt      @map("updated_at")
+
+  // Relations
+  tenant          Tenant              @relation(fields: [tenantId], references: [id])
+  refreshTokens   RefreshToken[]
+  verifications   EmailVerification[]
+  passwordResets  PasswordReset[]
+  createdInvoices Invoice[]           @relation("InvoiceCreatedBy")
+  createdClients  Client[]            @relation("ClientCreatedBy")
+  createdProducts Product[]           @relation("ProductCreatedBy")
+  createdQuotes   Quote[]             @relation("QuoteCreatedBy")
+
+  @@index([tenantId, role])
+  @@index([email, isActive])
+  @@map("users")
+}
+
+// ─── RefreshToken ─────────────────────────────────────────────────────────────
+// Jamais le token brut en base — uniquement son hash SHA-256.
+// Rotation : à chaque refresh, l'ancien token est révoqué et un nouveau émis.
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+
+  tokenHash  String   @map("token_hash") @db.VarChar(255) // SHA-256(token_brut)
+  deviceHint String?  @map("device_hint") @db.VarChar(255) // résumé du User-Agent
+  ipAddress  String?  @map("ip_address")  @db.VarChar(45)
+
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at") // NULL = actif
+
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])                   // lookup rapide à chaque refresh
+  @@index([userId, revokedAt])           // liste des sessions actives par user
+  @@map("refresh_tokens")
+}
+
+// ─── EmailVerification ────────────────────────────────────────────────────────
+// Token envoyé par email à l'inscription. TTL 24h. Usage unique.
+
+model EmailVerification {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+
+  tokenHash String   @map("token_hash") @db.VarChar(255) // SHA-256(token_brut)
+  expiresAt DateTime @map("expires_at")                  // now() + 24h
+  usedAt    DateTime? @map("used_at")                    // NULL = pas encore utilisé
+
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+  @@map("email_verifications")
+}
+
+// ─── PasswordReset ────────────────────────────────────────────────────────────
+// Token envoyé par email pour réinitialiser le mot de passe. TTL 1h. Usage unique.
+
+model PasswordReset {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+
+  tokenHash String   @map("token_hash") @db.VarChar(255) // SHA-256(token_brut)
+  expiresAt DateTime @map("expires_at")                  // now() + 1h
+  usedAt    DateTime? @map("used_at")                    // NULL = pas encore utilisé
+  ipAddress String?   @map("ip_address") @db.VarChar(45) // IP ayant initié la demande
+
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+  @@map("password_resets")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CLIENTS — Enums + Modèles
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum ClientType {
+  INDIVIDUAL // Particulier
+  COMPANY    // Entreprise
+}
+
+enum ClientStatus {
+  PROSPECT // Prospect (pas encore client)
+  ACTIVE   // Client actif
+  INACTIVE // Inactif (plus de relation commerciale)
+  ARCHIVED // Archivé (soft delete)
+}
+
+// ─── Client ───────────────────────────────────────────────────────────────────
+
+model Client {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  // Identification
+  type   ClientType   @default(COMPANY)
+  status ClientStatus @default(PROSPECT)
+  name   String       @db.VarChar(255) // Raison sociale ou nom complet
+
+  // Coordonnées principales
+  email   String? @db.VarChar(255)
+  phone   String? @db.VarChar(30)
+  website String? @db.VarChar(255)
+
+  // Informations légales (entreprises)
+  siret     String? @db.VarChar(20)
+  vatNumber String? @map("vat_number") @db.VarChar(30)
+
+  // Adresse de facturation
+  addressLine1 String? @map("address_line1") @db.VarChar(255)
+  addressLine2 String? @map("address_line2") @db.VarChar(255)
+  city         String? @db.VarChar(100)
+  zipCode      String? @map("zip_code") @db.VarChar(20)
+  country      String  @default("FR") @db.Char(2)
+
+  // Adresse de livraison (si différente)
+  shippingAddressLine1 String? @map("shipping_address_line1") @db.VarChar(255)
+  shippingAddressLine2 String? @map("shipping_address_line2") @db.VarChar(255)
+  shippingCity         String? @map("shipping_city") @db.VarChar(100)
+  shippingZipCode      String? @map("shipping_zip_code") @db.VarChar(20)
+  shippingCountry      String? @map("shipping_country") @db.Char(2)
+
+  // Paramètres commerciaux
+  paymentTermDays Int?    @map("payment_term_days")  // Délai de paiement (surcharge le défaut du tenant)
+  currency        String  @default("EUR") @db.Char(3)
+  notes           String? @db.Text
+
+  // Tags pour la segmentation (tableau de strings)
+  tags String[] @default([])
+
+  // Audit
+  createdBy String   @map("created_by") // FK → users.id
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant   Tenant          @relation(fields: [tenantId], references: [id])
+  creator  User            @relation("ClientCreatedBy", fields: [createdBy], references: [id])
+  contacts ClientContact[]
+  quotes   Quote[]   @relation("QuoteClient")
+  invoices Invoice[] @relation("InvoiceClient")
+
+  @@index([tenantId, status])
+  @@index([tenantId, name])
+  @@index([tenantId, email])
+  @@map("clients")
+}
+
+// ─── ClientContact ────────────────────────────────────────────────────────────
+// Contacts multiples par client (interlocuteurs)
+
+model ClientContact {
+  id       String @id @default(uuid())
+  clientId String @map("client_id")
+
+  firstName String  @map("first_name") @db.VarChar(100)
+  lastName  String  @map("last_name")  @db.VarChar(100)
+  role      String? @db.VarChar(100) // ex: "Comptable", "Directeur", "Achat"
+  email     String? @db.VarChar(255)
+  phone     String? @db.VarChar(30)
+  isPrimary Boolean @default(false) @map("is_primary") // Contact principal
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, isPrimary])
+  @@map("client_contacts")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FACTURATION — Enums
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum InvoiceType {
+  INVOICE         // Facture classique
+  CREDIT_NOTE     // Avoir
+  DEPOSIT_INVOICE // Facture d'acompte
+}
+
+enum InvoiceStatus {
+  DRAFT     // Brouillon
+  SENT      // Envoyée
+  PARTIAL   // Partiellement payée
+  PAID      // Payée intégralement
+  CANCELLED // Annulée
+  OVERDUE   // En retard de paiement
+}
+
+enum DiscountType {
+  PERCENT // Remise en pourcentage
+  FIXED   // Remise en montant fixe (€)
+}
+
+enum PaymentMethod {
+  BANK_TRANSFER // Virement bancaire
+  CARD          // Carte bancaire
+  CHECK         // Chèque
+  CASH          // Espèces
+  STRIPE        // Paiement en ligne Stripe
+}
+
+enum DepositStatus {
+  PENDING  // Acompte demandé
+  INVOICED // Facture d'acompte émise
+  RECEIVED // Acompte encaissé
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMPTABILITÉ — Enums
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum JournalEntryType {
+  SALE        // Écriture de vente (facture émise)
+  RECEIPT     // Encaissement (paiement reçu)
+  CREDIT_NOTE // Avoir émis
+  DEPOSIT     // Facture d'acompte
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DEVIS — Enums + Modèles
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum QuoteStatus {
+  DRAFT     // Brouillon — modifiable
+  SENT      // Envoyé au client
+  ACCEPTED  // Accepté par le client
+  REJECTED  // Refusé
+  EXPIRED   // Date de validité dépassée
+  CONVERTED // Converti en facture (terminal)
+}
+
+// ─── Quote ────────────────────────────────────────────────────────────────────
+
+model Quote {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  clientId String @map("client_id")
+
+  // Identification
+  number String      @unique            // DEV-2026-0001
+  status QuoteStatus @default(DRAFT)
+
+  // Dates
+  issueDate   DateTime @map("issue_date")   @db.Date
+  expiryDate  DateTime @map("expiry_date")  @db.Date // Date de validité
+
+  // Contenu
+  subject String
+  notes   String? @db.Text // Notes internes (non visibles sur le PDF)
+  footer  String? @db.Text // Mentions légales / conditions générales
+
+  // ── Remise globale ────────────────────────────────────────────────────────
+  discountType   DiscountType? @map("discount_type")
+  discountValue  Decimal?      @map("discount_value")  @db.Decimal(10, 2)
+
+  // ── Totaux calculés et persistés ─────────────────────────────────────────
+  subtotalHt     Decimal @map("subtotal_ht")     @db.Decimal(10, 2) // Σ lignes HT
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(10, 2)
+  totalHt        Decimal @map("total_ht")        @db.Decimal(10, 2)
+  totalVat       Decimal @map("total_vat")       @db.Decimal(10, 2)
+  totalTtc       Decimal @map("total_ttc")       @db.Decimal(10, 2)
+
+  // ── Suivi commercial ─────────────────────────────────────────────────────
+  sentAt      DateTime? @map("sent_at")
+  acceptedAt  DateTime? @map("accepted_at")
+  rejectedAt  DateTime? @map("rejected_at")
+  rejectedReason String? @map("rejected_reason") @db.VarChar(500)
+  convertedAt DateTime? @map("converted_at")
+
+  // Audit
+  pdfUrl    String?  @map("pdf_url")
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  // Relations
+  tenant   Tenant      @relation(fields: [tenantId], references: [id])
+  client   Client      @relation("QuoteClient",     fields: [clientId],  references: [id])
+  creator  User        @relation("QuoteCreatedBy",  fields: [createdBy], references: [id])
+  lines    QuoteLine[]
+  invoices Invoice[]   // Une facture peut être issue de ce devis
+
+  @@index([tenantId, status])
+  @@index([tenantId, clientId])
+  @@index([tenantId, expiryDate])
+  @@map("quotes")
+}
+
+// ─── QuoteLine ────────────────────────────────────────────────────────────────
+
+model QuoteLine {
+  id        String  @id @default(uuid())
+  quoteId   String  @map("quote_id")
+  productId String? @map("product_id") // Référence catalogue (optionnel)
+
+  description String
+  quantity    Decimal @db.Decimal(10, 3)
+  unitPrice   Decimal @map("unit_price") @db.Decimal(10, 2)
+  vatRate     Decimal @map("vat_rate")   @db.Decimal(5, 2)
+
+  // Remise par ligne
+  discountType   DiscountType? @map("discount_type")
+  discountValue  Decimal?      @map("discount_value") @db.Decimal(10, 2)
+
+  // Montants calculés et persistés
+  lineBaseHt      Decimal @map("line_base_ht")       @db.Decimal(10, 2)
+  lineDiscountAmt Decimal @default(0) @map("line_discount_amt") @db.Decimal(10, 2)
+  lineTotalHt     Decimal @map("line_total_ht")       @db.Decimal(10, 2)
+  lineVatAmount   Decimal @map("line_vat_amount")     @db.Decimal(10, 2)
+  lineTotalTtc    Decimal @map("line_total_ttc")      @db.Decimal(10, 2)
+
+  position Int
+
+  quote   Quote    @relation(fields: [quoteId],   references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([quoteId])
+  @@map("quote_lines")
+}
+
+// ─── Invoice ─────────────────────────────────────────────────────────────────
+
+model Invoice {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  clientId String @map("client_id")
+  quoteId  String? @map("quote_id") // Facture issue d'un devis
+
+  // Identification
+  number String        @unique             // FAC-2026-0001
+  type   InvoiceType   @default(INVOICE)
+  status InvoiceStatus @default(DRAFT)
+
+  // Dates
+  issueDate DateTime @map("issue_date") @db.Date
+  dueDate   DateTime @map("due_date") @db.Date
+
+  // Contenu
+  subject String
+  notes   String? // Notes internes
+  footer  String? // Mentions légales / pied de page
+
+  // ── Remise globale (appliquée après les remises de lignes) ────────────────
+  discountType  DiscountType? @map("discount_type")
+  discountValue Decimal?      @map("discount_value") @db.Decimal(10, 2)
+
+  // ── Acompte ───────────────────────────────────────────────────────────────
+  // Montant d'acompte déduit du solde dû
+  depositAmount Decimal @default(0) @map("deposit_amount") @db.Decimal(10, 2)
+
+  // ── Totaux (calculés et persistés pour audit) ─────────────────────────────
+  subtotalHt Decimal @map("subtotal_ht") @db.Decimal(10, 2) // Σ lignes HT avant remise globale
+  discountAmount Decimal @default(0) @map("discount_amount") @db.Decimal(10, 2) // Montant remise globale
+  totalHt    Decimal @map("total_ht") @db.Decimal(10, 2)    // HT après remise globale
+  totalVat   Decimal @map("total_vat") @db.Decimal(10, 2)   // Total TVA
+  totalTtc   Decimal @map("total_ttc") @db.Decimal(10, 2)   // TTC (totalHt + totalVat)
+  amountPaid Decimal @default(0) @map("amount_paid") @db.Decimal(10, 2) // Paiements reçus
+  amountDue  Decimal @map("amount_due") @db.Decimal(10, 2)  // Solde restant (totalTtc - depositAmount - amountPaid)
+
+  // ── Meta ──────────────────────────────────────────────────────────────────
+  pdfUrl    String?   @map("pdf_url")
+  sentAt    DateTime? @map("sent_at")
+  paidAt    DateTime? @map("paid_at")
+  createdBy String    @map("created_by") // FK → users.id
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  // ── Relations ─────────────────────────────────────────────────────────────
+  tenant      Tenant        @relation(fields: [tenantId], references: [id])
+  client      Client        @relation("InvoiceClient",   fields: [clientId],  references: [id])
+  quote       Quote?        @relation(fields: [quoteId], references: [id],    onDelete: SetNull)
+  creator     User          @relation("InvoiceCreatedBy",fields: [createdBy], references: [id])
+  lines          InvoiceLine[]
+  vatSummary     VatSummary[]
+  payments       Payment[]
+  deposits       Deposit[]
+  journalEntries JournalEntry[] @relation("JournalInvoice")
+
+  @@index([tenantId, status])
+  @@index([tenantId, clientId])
+  @@index([tenantId, dueDate])
+  @@map("invoices")
+}
+
+// ─── Invoice Line ─────────────────────────────────────────────────────────────
+
+model InvoiceLine {
+  id        String  @id @default(uuid())
+  invoiceId String  @map("invoice_id")
+  productId String? @map("product_id") // Référence au catalogue (optionnel)
+
+  // Contenu
+  description String
+  quantity    Decimal @db.Decimal(10, 3)
+  unitPrice   Decimal @map("unit_price") @db.Decimal(10, 2) // Prix unitaire HT
+  vatRate     Decimal @map("vat_rate") @db.Decimal(5, 2)    // 0 | 5.5 | 10 | 20
+
+  // ── Remise par ligne ──────────────────────────────────────────────────────
+  discountType   DiscountType? @map("discount_type")
+  discountValue  Decimal?      @map("discount_value") @db.Decimal(10, 2)
+
+  // ── Montants calculés (persistés) ─────────────────────────────────────────
+  lineBaseHt      Decimal @map("line_base_ht") @db.Decimal(10, 2)      // quantity * unitPrice
+  lineDiscountAmt Decimal @default(0) @map("line_discount_amt") @db.Decimal(10, 2) // Montant remise ligne
+  lineTotalHt     Decimal @map("line_total_ht") @db.Decimal(10, 2)     // HT après remise ligne
+  lineVatAmount   Decimal @map("line_vat_amount") @db.Decimal(10, 2)   // TVA de la ligne
+  lineTotalTtc    Decimal @map("line_total_ttc") @db.Decimal(10, 2)    // TTC de la ligne
+
+  position Int // Ordre d'affichage
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@map("invoice_lines")
+}
+
+// ─── VAT Summary ─────────────────────────────────────────────────────────────
+// Récapitulatif TVA par taux (affiché en bas de facture)
+
+model VatSummary {
+  id        String @id @default(uuid())
+  invoiceId String @map("invoice_id")
+
+  vatRate   Decimal @map("vat_rate") @db.Decimal(5, 2)  // Taux (ex: 20.00)
+  baseHt    Decimal @map("base_ht") @db.Decimal(10, 2)  // Base HT soumise à ce taux
+  vatAmount Decimal @map("vat_amount") @db.Decimal(10, 2) // Montant TVA
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, vatRate])
+  @@map("vat_summaries")
+}
+
+// ─── Payment ─────────────────────────────────────────────────────────────────
+
+model Payment {
+  id        String @id @default(uuid())
+  tenantId  String @map("tenant_id")
+  invoiceId String @map("invoice_id")
+
+  amount      Decimal       @db.Decimal(10, 2)
+  method      PaymentMethod
+  reference   String?  // Réf virement, n° chèque, ID transaction
+  paymentDate DateTime @map("payment_date") @db.Date
+
+  stripeId        String?   @map("stripe_id")       // ID charge Stripe
+  stripeReceiptUrl String?  @map("stripe_receipt_url")
+  notes    String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id])
+  invoice        Invoice        @relation(fields: [invoiceId], references: [id])
+  journalEntries JournalEntry[] @relation("JournalPayment")
+
+  @@index([tenantId, invoiceId])
+  @@index([tenantId, paymentDate])
+  @@map("payments")
+}
+
+// ─── Deposit (Acompte) ───────────────────────────────────────────────────────
+// Un acompte est demandé sur une facture et peut générer sa propre facture d'acompte
+
+model Deposit {
+  id        String @id @default(uuid())
+  tenantId  String @map("tenant_id")
+  invoiceId String @map("invoice_id") // Facture principale
+
+  // Montant de l'acompte : fixe ou % du total TTC
+  amountType  DiscountType @map("amount_type") // FIXED ou PERCENT
+  amountValue Decimal      @map("amount_value") @db.Decimal(10, 2)
+  amountResolved Decimal   @map("amount_resolved") @db.Decimal(10, 2) // Montant € calculé
+
+  status DepositStatus @default(PENDING)
+
+  // Facture d'acompte générée (optionnel)
+  depositInvoiceId String?  @map("deposit_invoice_id")
+  depositInvoiceNumber String? @map("deposit_invoice_number") // ACPT-2026-0001
+
+  // Paiement de l'acompte
+  paidAt    DateTime? @map("paid_at")
+  paymentRef String?  @map("payment_ref")
+
+  dueDate   DateTime  @map("due_date") @db.Date
+  notes     String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id])
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([tenantId, invoiceId])
+  @@map("deposits")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PRODUITS / SERVICES — Enums + Modèles
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum ProductType {
+  PRODUCT // Bien physique
+  SERVICE // Prestation de service
+  DIGITAL // Produit numérique / licence
+}
+
+enum ProductUnit {
+  PIECE  // Pièce / unité
+  HOUR   // Heure
+  DAY    // Jour
+  MONTH  // Mois
+  KG     // Kilogramme
+  LITER  // Litre
+  METER  // Mètre
+  FLAT   // Forfait
+}
+
+// ─── ProductCategory ──────────────────────────────────────────────────────────
+// Catégories libres par tenant (ex : "Développement", "Conseil", "Hébergement")
+
+model ProductCategory {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  name        String  @db.VarChar(100)
+  description String? @db.VarChar(255)
+  color       String? @db.Char(7) // Couleur hex (#FF5733) pour l'UI
+  position    Int     @default(0) // Ordre d'affichage
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id])
+  products Product[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, position])
+  @@map("product_categories")
+}
+
+// ─── Product ──────────────────────────────────────────────────────────────────
+
+model Product {
+  id         String @id @default(uuid())
+  tenantId   String @map("tenant_id")
+  categoryId String? @map("category_id")
+
+  // Identification
+  type     ProductType @default(SERVICE)
+  sku      String?     @db.VarChar(100) // Référence interne / code article
+  name     String      @db.VarChar(255)
+  description      String? @db.Text   // Description longue (affichée sur devis/facture)
+  descriptionShort String? @map("description_short") @db.VarChar(500) // Description courte (liste)
+
+  // Tarification HT
+  unitPrice    Decimal @map("unit_price") @db.Decimal(10, 2)
+  unit         ProductUnit @default(PIECE)
+  currency     String  @default("EUR") @db.Char(3)
+
+  // TVA
+  vatRate      Decimal @map("vat_rate") @db.Decimal(5, 2) // 0 | 5.5 | 10 | 20
+  vatExempt    Boolean @default(false)  @map("vat_exempt") // Exonéré de TVA (art. 293B)
+  vatExemptRef String? @map("vat_exempt_ref") @db.VarChar(255) // Mention légale si exonéré
+
+  // Prix de revient (pour la marge — non affiché sur les documents)
+  costPrice    Decimal? @map("cost_price") @db.Decimal(10, 2)
+
+  // Statut
+  isActive     Boolean @default(true)  @map("is_active")
+  isFavorite   Boolean @default(false) @map("is_favorite") // Épinglé dans le sélecteur
+
+  // Audit
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  // Relations
+  tenant       Tenant           @relation(fields: [tenantId], references: [id])
+  category     ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  creator      User             @relation("ProductCreatedBy", fields: [createdBy], references: [id])
+  invoiceLines InvoiceLine[]
+  quoteLines   QuoteLine[]
+
+  @@index([tenantId, isActive])
+  @@index([tenantId, type])
+  @@index([tenantId, categoryId])
+  @@index([tenantId, sku])
+  @@map("products")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMPTABILITÉ — Modèles
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── JournalEntry ─────────────────────────────────────────────────────────────
+// Écritures comptables au format Plan Comptable Général (PCG) français.
+// Générées automatiquement à chaque événement facturation (émission, paiement,
+// avoir). Immuables une fois générées (audit trail légal).
+
+model JournalEntry {
+  id        String  @id @default(uuid())
+  tenantId  String  @map("tenant_id")
+  invoiceId String? @map("invoice_id") // Facture source (si applicable)
+  paymentId String? @map("payment_id") // Paiement source (si applicable)
+
+  // Classification
+  entryType  JournalEntryType @map("entry_type")
+  journalCode String          @map("journal_code") @db.VarChar(2)   // VE | BQ | AV
+  journalLib  String          @map("journal_lib")  @db.VarChar(50)  // Ventes | Banque | Avoirs
+
+  // Identification comptable
+  date      DateTime @db.Date
+  reference String   @db.VarChar(50)   // Ex : FAC-2026-0001
+  label     String   @db.VarChar(255)  // Description de l'écriture
+
+  // Comptes PCG (Plan Comptable Général)
+  accountDebit  String @map("account_debit")  @db.VarChar(10) // Ex : 411000
+  accountCredit String @map("account_credit") @db.VarChar(10) // Ex : 706000
+
+  // Montants
+  amountHt  Decimal  @map("amount_ht")  @db.Decimal(10, 2)
+  amountVat Decimal  @map("amount_vat") @db.Decimal(10, 2)
+  amountTtc Decimal  @map("amount_ttc") @db.Decimal(10, 2)
+  vatRate   Decimal? @map("vat_rate")   @db.Decimal(5, 2)  // Taux TVA de la ligne
+
+  // Statut de validation (true = écriture définitive, non modifiable)
+  isPosted Boolean @default(false) @map("is_posted")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  tenant  Tenant   @relation(fields: [tenantId],  references: [id])
+  invoice Invoice? @relation("JournalInvoice", fields: [invoiceId], references: [id], onDelete: SetNull)
+  payment Payment? @relation("JournalPayment", fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, date])
+  @@index([tenantId, entryType])
+  @@index([tenantId, reference])
+  @@index([tenantId, isPosted])
+  @@map("journal_entries")
+}
